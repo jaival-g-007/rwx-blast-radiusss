@@ -1,0 +1,11 @@
+*
+!Dockerfile
+!selector.py
+!impact.py
+!comparisons.py
+!patches.py
+!coverage.json
+!operands.json
+!tools/
+tools/*
+!tools/extract_sources.py
