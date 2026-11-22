@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ast
 import json
+import pickle
+from pathlib import Path
 from bisect import bisect_left
 from collections import defaultdict
 from functools import cache
@@ -37,6 +39,8 @@ class Source:
             ) and hasattr(node, "lineno"):
                 for line in range(first_line(node), node.end_lineno + 1):
                     self.at[line] = node
+
+        self.signature = ast.dump(self.tree)
 
     def ancestors(self, line):
         node = self.at.get(line)
@@ -112,6 +116,12 @@ class Impact:
         path = (self.source_root / name).resolve()
         if not path.is_relative_to(self.source_root):
             raise UnsupportedPatch("source outside checkout")
+        # Only read build-produced metadata, from the fixed, read-only image.
+        if self.source_root == Path("/src"):
+            stored = Path("/baseline") / (name + ".bin")
+            if stored.is_file():
+                with stored.open("rb") as handle:
+                    return pickle.load(handle)
         return Source(path.read_bytes().decode("utf-8"))
 
     def hits(self, filename, first, last):
@@ -247,7 +257,7 @@ class Impact:
         values = new.values
         try:
             new.values = old.values
-            if ast.dump(tree) != ast.dump(source.tree):
+            if ast.dump(tree) != source.signature:
                 return None
         finally:
             new.values = values
@@ -299,7 +309,7 @@ class Impact:
         body = replacement.body
         try:
             replacement.body = original.body
-            if ast.dump(tree) != ast.dump(source.tree):
+            if ast.dump(tree) != source.signature:
                 return None
         finally:
             replacement.body = body
@@ -309,6 +319,34 @@ class Impact:
             mask |= cold.hits(original.lineno, original.end_lineno)
         # Include tests that inspect function internals even without calling them.
         return mask | self.introspection | self.reads.get(filename, 0)
+
+    def local_header_change(self, filename, source, tree, edits):
+        """Prove a changed import/definition is confined to a function body."""
+        line = edits[0][0]
+        for outer in source.ancestors(line):
+            if not isinstance(outer, FUNCTION) or line < outer.body[0].lineno:
+                continue
+            if any(start < outer.body[0].lineno or start + max(1, deleted) - 1 > outer.end_lineno
+                   for start, deleted, _ in edits):
+                continue
+            current = next((n for n in ast.walk(tree) if type(n) is type(outer)
+                            and n.lineno == outer.lineno and n.col_offset == outer.col_offset
+                            and n.name == outer.name), None)
+            if current is None:
+                continue
+            body = current.body
+            try:
+                current.body = outer.body
+                if ast.dump(tree) != source.signature:
+                    continue
+            finally:
+                current.body = body
+            mask = self.hits(filename, outer.lineno, outer.end_lineno)
+            cold = self.cold.get(filename)
+            if cold:
+                mask |= cold.hits(outer.lineno, outer.end_lineno)
+            return mask | self.reads.get(filename, 0) | self.introspection
+        return self.broad(filename)
 
     def select_file(self, change):
         filename = change.old or change.new
@@ -321,6 +359,10 @@ class Impact:
             return self.all
         source = self.source(filename)
         patched = change.apply(source.text)
+        # Discard separate edits containing only blank lines or comments if
+        # the resulting Python syntax tree still exactly matches the patch.
+        effective = change.without_trivia()
+
         try:
             tree = ast.parse(patched)
             compile(tree, filename, "exec", dont_inherit=True)
@@ -328,17 +370,25 @@ class Impact:
             return self.broad(filename)
         # Ordinary comment and layout edits can still affect tests that
         # read source text or line locations. Keep their explicit readers.
-        if ast.dump(tree) == ast.dump(source.tree):
+        if ast.dump(tree) == source.signature:
             return self.reads.get(filename, 0)
+        if effective is not change:
+            try:
+                reduced = ast.parse(effective.apply(source.text))
+            except (SyntaxError, ValueError, UnsupportedPatch):
+                pass
+            else:
+                if ast.dump(reduced) == ast.dump(tree):
+                    change, tree = effective, reduced
         # Import paths, renamed definitions and decorators can break collection
         # before any test body runs. A module-level exception has the same risk.
         headers = ("import ", "from ", "class ", "def ", "async def ", "@")
         changed_text = [
             text for hunk in change.hunks for kind, text in hunk.rows if kind != " "
         ]
-        if any(text.lstrip().startswith(headers) for text in changed_text):
-            return self.broad(filename)
         edits = list(change.edits())
+        if any(text.lstrip().startswith(headers) for text in changed_text):
+            return self.local_header_change(filename, source, tree, edits)
         precise = self.lambda_users(filename, source, tree, edits)
         if precise is not None:
             return precise

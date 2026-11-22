@@ -1,6 +1,6 @@
 # RWX Blast Radius
 
-A regression test selector for SQLGlot at `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`. The entry reads the grader's test catalogue and unified diffs, then writes one JSON line per patch. At scoring time it uses the Python standard library and three checked-in indexes generated from the original revision, with bounded local execution of selected tests.
+A regression test selector for SQLGlot at `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`. The entry reads the grader's test catalogue and unified diffs, then writes one JSON line per patch. At scoring time it uses the Python standard library and three checked-in indexes generated from the original revision. The image build prepares syntax and source-line metadata from that revision for fast loading during scoring.
 
 ## Results
 
@@ -8,10 +8,11 @@ A regression test selector for SQLGlot at `eb11aec4be8cb2122afe713a4816662c3f0fb
 |---|---:|---:|---:|
 | Organizer's starter on the supplied sample | 30 | 1,210.470 | 0 |
 | Previous entry on the same sample | 30 | 113.490 | 0 |
-| This revision on the same sample | 30 | 103.379 | 0 |
+| Live-replay entry on the same sample | 30 | 103.379 | 0 |
+| Current static selector on the same sample | 30 | 107.985 | 0 |
 | Three independent validation changes | 3 | 6.887 | 0 |
 
-The revision saves 10.111 simulated seconds on the public sample. The organizer's unmodified scorer calculated both sample scores. The independent changes altered MySQL SQL generation, edited a fixture and a test together, and broke a test-module import. A fourth independent patch changed the hexadecimal escape base in PostgreSQL. A full pytest run identified one failing test, which the revised selector included. The full pinned suite was run on each altered checkout to identify the failing tests and the unimportable file. A further 60-patch check permuted the test numbers, renamed every patch and introduced a previously unseen test. The remapped selections matched in all 60 cases.
+The organizer's unmodified scorer calculated both sample scores. The independent changes altered MySQL SQL generation, edited a fixture and a test together, and broke a test-module import. A fourth independent patch changed the hexadecimal escape base in PostgreSQL. A full pytest run identified one failing test, which the revised selector included. The full pinned suite was run on each altered checkout to identify the failing tests and the unimportable file. A further 60-patch check permuted the test numbers, renamed every patch and introduced a previously unseen test. The remapped selections matched in all 60 cases.
 
 The earlier submission scored 344.9 seconds on the hidden practice batch. The checked-in indexes were built solely from the pinned source and its original tests. The official score adds container CPU time and uses hidden changes. A public-sample score measures behavior on those 30 changes.
 
@@ -35,7 +36,7 @@ Run the focused regression tests with `make test` using Python 3.10 or later. Th
 2. **Find affected tests.** For a function edit, look up tests that executed the changed lines and the enclosing statement or condition. For class configuration, combine observed class and subclass use with source references. For a fixture, include the tests that opened the file. Shared setup observations apply to the tests in their scope. Cold imports and serialization across process-pool boundaries are recorded explicitly.
 3. **Check comparisons where evidence permits.** If the source trees differ in a single binary comparison, evaluate both expressions over the supported operand values observed at that location. A test can be removed when every represented pair gives the same result. Unknown operators, custom comparisons, incomplete observations and truncated value sets keep the test. Explicit source readers and cold-import dependencies remain eligible.
 4. **Trace dictionary reads.** For a value-only change to a class mapping, follow aliases and direct constructor parameters in the baseline sources to dictionary lookups. A measured test that only reads other keys can be excluded. Unresolved uses disable this refinement. A separate check handles edits confined to the body of an existing lambda while retaining source and bytecode readers.
-5. **Replay small candidate sets.** For restricted literal and operator edits, run inexpensive, self-contained unittest cases in a fresh interpreter with a patched import loader. Successful tests may be removed. Collection and fixture errors or timeouts preserve the fallback. Replay is limited to two seconds per process and an eighteen-second batch window.
+5. **Resolve mixed changes.** Ignore separate comment or blank-line edits only when excluding them produces exactly the same syntax tree as the original patch. For a modified local import, restore the previous function body in the modified tree and check that the entire original tree is recovered. If so, retain function users, source readers, bytecode inspection and cold-import coverage.
 6. **Handle uncertainty.** Unsupported patches and unfamiliar file changes use a broader selection. New test IDs are included. The runtime resolves pytest IDs against the grader's current test numbers.
 7. **Price worker assignments.** Durations are converted to integer milliseconds. For one through eight workers, place longer tests on the least-loaded worker and compare the largest load plus 2,000 ms per occupied worker. A lower bound skips worker counts that cannot improve the current plan. The selector uses the cheapest assignment it constructs.
 

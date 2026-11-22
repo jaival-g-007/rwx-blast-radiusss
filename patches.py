@@ -64,6 +64,31 @@ class Change:
             if deleted or added:
                 yield start, deleted, added
 
+    def without_trivia(self):
+        if sum(1 for _ in self.edits()) < 2:
+            return self
+        hunks = []
+        changed = False
+        for hunk in self.hunks:
+            rows = []
+            i = 0
+            while i < len(hunk.rows):
+                if hunk.rows[i][0] == " ":
+                    rows.append(hunk.rows[i])
+                    i += 1
+                    continue
+                start = i
+                while i < len(hunk.rows) and hunk.rows[i][0] != " ":
+                    i += 1
+                block = hunk.rows[start:i]
+                if all(not text.strip() or text.lstrip().startswith("#") for _, text in block):
+                    rows.extend((" ", text) for kind, text in block if kind == "-")
+                    changed = True
+                else:
+                    rows.extend(block)
+            hunks.append(Hunk(hunk.start, rows))
+        return Change(self.old, self.new, hunks) if changed else self
+
     def apply(self, source):
         # Split on LF only. A form feed in Python source is not a Git line break.
         lines = [line + "\n" for line in source.split("\n")]

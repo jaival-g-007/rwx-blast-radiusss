@@ -5,9 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import time
 
-from replay import refine
 from pathlib import Path
 
 from impact import Impact
@@ -63,8 +61,6 @@ def run(data_dir, index_path, source_root):
     tests = json.loads((data_dir / "tests.json").read_bytes())["tests"]
     durations = {t["number"]: math.floor(t["seconds"] * 1000 + 0.5) for t in tests}
     impact = Impact(index_path, source_root.resolve(), tests)
-    catalogue = {t["number"]: t for t in tests}
-    deadline = time.monotonic() + 18
     schedules = {}
     entries = []
     for patch in sorted((data_dir / "commits").glob("*.patch")):
@@ -82,19 +78,9 @@ def run(data_dir, index_path, source_root):
             RecursionError,
         ):
             mask = impact.all
-            changes = []
         if mask not in schedules:
             schedules[mask] = schedule(impact.numbers(mask), durations)
-        workers = schedules[mask]
-        if len(changes) == 1 and workers:
-            selected = {n for group in workers for n in group}
-            kept = (
-                refine(changes[0], impact, catalogue, selected, deadline)
-                | impact.always
-            )
-            if kept != selected:
-                workers = schedule(kept, durations)
-        entries.append((patch.stem, workers))
+        entries.append((patch.stem, schedules[mask]))
     for row in fit_output(entries):
         print(row)
 

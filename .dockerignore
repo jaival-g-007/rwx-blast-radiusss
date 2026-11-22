@@ -11,3 +11,4 @@ tools/*
 !tools/extract_sources.py
 !replay.py
 !lookup_keys.json
+!prepare.py
