@@ -9,3 +9,5 @@
 !tools/
 tools/*
 !tools/extract_sources.py
+!replay.py
+!lookup_keys.json

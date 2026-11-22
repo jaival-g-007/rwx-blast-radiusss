@@ -8,6 +8,7 @@ import sys
 import json
 from collections import defaultdict
 from pathlib import Path
+from mapping_uses import consumers
 
 REVISION = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 
@@ -20,7 +21,14 @@ def symbol_coverage(root, lines, types):
     from sqlglot.generator import Generator
     from sqlglot.tokens import Tokenizer
 
-    classes = [exp.Expr, Parser, Generator, Tokenizer, Dialect, *Dialect.classes.values()]
+    classes = [
+        exp.Expr,
+        Parser,
+        Generator,
+        Tokenizer,
+        Dialect,
+        *Dialect.classes.values(),
+    ]
     seen = set()
     while classes:
         cls = classes.pop()
@@ -39,7 +47,9 @@ def symbol_coverage(root, lines, types):
             trace = lines.get(relative, {})
             tree = ast.parse(path.read_bytes())
             parents = {
-                child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
+                child: node
+                for node in ast.walk(tree)
+                for child in ast.iter_child_nodes(node)
             }
             for node in ast.walk(tree):
                 if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
@@ -72,7 +82,9 @@ def symbol_coverage(root, lines, types):
                         parent, (ast.FunctionDef, ast.Lambda, ast.AsyncFunctionDef)
                     ):
                         parent = parents[parent]
-                    if isinstance(parent, ast.Module) or getattr(parent, "name", "") in (
+                    if isinstance(parent, ast.Module) or getattr(
+                        parent, "name", ""
+                    ) in (
                         "__new__",
                         "__init_subclass__",
                         "__set_name__",
@@ -80,6 +92,26 @@ def symbol_coverage(root, lines, types):
                     ):
                         derived.add(name)
     return symbols, sorted(derived)
+
+
+def code_inspection(source):
+    sites = {}
+    for directory in ("sqlglot", "tests"):
+        for file in sorted((source / directory).rglob("*.py")):
+            tree = ast.parse(file.read_bytes())
+            lines = sorted(
+                {
+                    n.lineno
+                    for n in ast.walk(tree)
+                    if isinstance(n, ast.Attribute)
+                    and n.attr == "__code__"
+                    or isinstance(n, ast.Constant)
+                    and n.value == "__code__"
+                }
+            )
+            if lines:
+                sites[file.relative_to(source).as_posix()] = lines
+    return sites
 
 
 def compact(traces, destination, source):
@@ -129,7 +161,12 @@ def compact(traces, destination, source):
             *types.values(),
             *symbols.values(),
             *imports.values(),
-            *(mask for table in (lines, cold) for f in table.values() for mask in f.values()),
+            *(
+                mask
+                for table in (lines, cold)
+                for f in table.values()
+                for mask in f.values()
+            ),
         }
     )
     ref = {mask: i for i, mask in enumerate(masks)}
@@ -150,6 +187,8 @@ def compact(traces, destination, source):
     ranges = encode_ranges(lines)
     result = {
         "revision": REVISION,
+        "code_inspection": code_inspection(source),
+        "mapping_uses": consumers(source),
         "tests": ids,
         "incomplete": catalog["incomplete"],
         "masks": [format(m, "x") for m in masks],

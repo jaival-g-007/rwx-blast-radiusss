@@ -25,7 +25,9 @@ class Source:
         self.text = text
         self.tree = ast.parse(text)
         self.parent = {
-            child: node for node in ast.walk(self.tree) for child in ast.iter_child_nodes(node)
+            child: node
+            for node in ast.walk(self.tree)
+            for child in ast.iter_child_nodes(node)
         }
         self.at = {}
         # Breadth-first visitation lets children replace their containing nodes.
@@ -81,14 +83,29 @@ class Impact:
                 self.number_by_bit[i] = number
                 self.test_files[test["file"]] |= 1 << i
         masks = [int(value, 16) & self.all for value in data["masks"]]
-        self.lines = {path: FileLines(ranges, masks) for path, ranges in data["lines"].items()}
-        self.cold = {path: FileLines(ranges, masks) for path, ranges in data["cold"].items()}
+        self.lines = {
+            path: FileLines(ranges, masks) for path, ranges in data["lines"].items()
+        }
+        self.cold = {
+            path: FileLines(ranges, masks) for path, ranges in data["cold"].items()
+        }
         self.imports = {path: masks[ref] for path, ref in data["imports"].items()}
         self.reads = {path: masks[ref] for path, ref in data["reads"].items()}
         self.symbols = {key: masks[ref] for key, ref in data["symbols"].items()}
         self.derived = set(data["derived"])
         self.types = {key: masks[ref] for key, ref in data["types"].items()}
-        self.comparisons = Comparisons(index_path.with_name("operands.json"), self.names, self.all)
+        self.mapping_users = data.get("mapping_uses", {})
+        key_path = index_path.with_name("lookup_keys.json")
+        self.lookup_keys = (
+            Comparisons(key_path, self.names, self.all) if key_path.exists() else None
+        )
+        self.introspection = 0
+        for path, lines in data.get("code_inspection", {}).items():
+            for line in lines:
+                self.introspection |= self.hits(path, line, line)
+        self.comparisons = Comparisons(
+            index_path.with_name("operands.json"), self.names, self.all
+        )
 
     @cache
     def source(self, name):
@@ -102,7 +119,11 @@ class Impact:
         return lines.hits(first, last) if lines else 0
 
     def file_users(self, path):
-        return self.hits(path, 1, 2**31) | self.reads.get(path, 0) | self.test_files.get(path, 0)
+        return (
+            self.hits(path, 1, 2**31)
+            | self.reads.get(path, 0)
+            | self.test_files.get(path, 0)
+        )
 
     def broad(self, filename):
         if filename.startswith("tests/") and filename in self.imports:
@@ -129,7 +150,9 @@ class Impact:
             consumers = self.types.get(typename)
             if consumers is None:
                 return self.broad(filename)
-            owner = ".".join(n.name for n in reversed(chain) if isinstance(n, ast.ClassDef))
+            owner = ".".join(
+                n.name for n in reversed(chain) if isinstance(n, ast.ClassDef)
+            )
             consumers |= self.symbols.get(owner, 0)
             assignment = next(
                 (n for n in chain if isinstance(n, (ast.Assign, ast.AnnAssign))), None
@@ -142,7 +165,11 @@ class Impact:
                 )
                 if len(targets) == 1 and isinstance(targets[0], ast.Name):
                     key = targets[0].id
-                    if key.isupper() and key in self.symbols and key not in self.derived:
+                    if (
+                        key.isupper()
+                        and key in self.symbols
+                        and key not in self.derived
+                    ):
                         consumers &= self.symbols[key]
             return consumers | readers | self.test_files.get(filename, 0)
         if isinstance(scope, ast.Lambda):
@@ -172,6 +199,117 @@ class Impact:
                 break
         return hits | readers
 
+    def mapping_filter(self, filename, source, tree, edits):
+        if len(edits) != 1:
+            return None
+        start, deleted, added = edits[0]
+        if deleted != 1 or added != 1:
+            return None
+        ancestors = list(source.ancestors(start))
+        assignment = next(
+            (n for n in ancestors if isinstance(n, (ast.Assign, ast.AnnAssign))), None
+        )
+        if assignment is None or not isinstance(
+            source.parent.get(assignment), ast.ClassDef
+        ):
+            return None
+        targets = (
+            assignment.targets
+            if isinstance(assignment, ast.Assign)
+            else [assignment.target]
+        )
+        if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+            return None
+        field = targets[0].id
+        if field not in self.mapping_users or not isinstance(
+            assignment.value, ast.Dict
+        ):
+            return None
+        old = assignment.value
+        new = next(
+            (
+                n
+                for n in ast.walk(tree)
+                if isinstance(n, ast.Dict)
+                and (n.lineno, n.col_offset) == (old.lineno, old.col_offset)
+            ),
+            None,
+        )
+        if new is None or len(new.values) != len(old.values):
+            return None
+        # Only scalar/tuple literals can be evaluated without side effects.
+        try:
+            for node in [*new.values, *old.values]:
+                if not isinstance(ast.literal_eval(node), (str, bool, int, tuple)):
+                    return None
+        except (TypeError, ValueError):
+            return None
+        values = new.values
+        try:
+            new.values = old.values
+            if ast.dump(tree) != ast.dump(source.tree):
+                return None
+        finally:
+            new.values = values
+        if not all(
+            isinstance(k, ast.Constant) and type(k.value) is str for k in old.keys
+        ):
+            return None
+        changed_keys = {
+            k.value
+            for k, a, b in zip(old.keys, old.values, values)
+            if ast.dump(a) != ast.dump(b)
+        }
+        consumers = self.reads.get(filename, 0) | self.introspection
+        for file, line, col in self.mapping_users[field]:
+            hits = self.hits(file, line, line)
+            if self.lookup_keys and col >= 0:
+                hits = self.lookup_keys.lookup_users(
+                    file, line, col, changed_keys, hits
+                )
+            consumers |= hits
+            if file in self.cold:
+                consumers |= self.cold[file].hits(line, line)
+        return consumers
+
+    def lambda_users(self, filename, source, tree, edits):
+        # A change confined to an existing lambda body leaves the surrounding
+        # dispatch key, defaults, and class initialization expression intact.
+        if len(edits) != 1:
+            return None
+        start, removed, added = edits[0]
+        if removed != 1 or added != 1:
+            return None
+        original = next(
+            (n for n in source.ancestors(start) if isinstance(n, ast.Lambda)), None
+        )
+        if original is None:
+            return None
+        replacement = next(
+            (
+                n
+                for n in ast.walk(tree)
+                if isinstance(n, ast.Lambda)
+                and (n.lineno, n.col_offset) == (original.lineno, original.col_offset)
+            ),
+            None,
+        )
+        if replacement is None:
+            return None
+        body = replacement.body
+        try:
+            replacement.body = original.body
+            if ast.dump(tree) != ast.dump(source.tree):
+                return None
+        finally:
+            replacement.body = body
+        mask = self.hits(filename, original.lineno, original.end_lineno)
+        cold = self.cold.get(filename)
+        if cold:
+            mask |= cold.hits(original.lineno, original.end_lineno)
+        # Include tests that inspect function internals even without calling them.
+        return mask | self.introspection | self.reads.get(filename, 0)
+
     def select_file(self, change):
         filename = change.old or change.new
         if change.old != change.new:
@@ -195,16 +333,23 @@ class Impact:
         # Import paths, renamed definitions and decorators can break collection
         # before any test body runs. A module-level exception has the same risk.
         headers = ("import ", "from ", "class ", "def ", "async def ", "@")
-        changed_text = [text for hunk in change.hunks for kind, text in hunk.rows if kind != " "]
+        changed_text = [
+            text for hunk in change.hunks for kind, text in hunk.rows if kind != " "
+        ]
         if any(text.lstrip().startswith(headers) for text in changed_text):
             return self.broad(filename)
         edits = list(change.edits())
+        precise = self.lambda_users(filename, source, tree, edits)
+        if precise is not None:
+            return precise
         mask = self.reads.get(filename, 0)
         protected = mask
         cold = self.cold.get(filename)
         for start, deleted, _ in edits:
             if cold:
-                protected |= cold.hits(max(1, start - (not deleted)), start + max(1, deleted) - 1)
+                protected |= cold.hits(
+                    max(1, start - (not deleted)), start + max(1, deleted) - 1
+                )
             if deleted:
                 selected = range(start, start + deleted)
             else:
@@ -213,6 +358,9 @@ class Impact:
                 mask |= self.at_line(filename, source, line, deleted == 0)
         if mask and self.comparisons.has_sites(filename, change):
             mask = self.comparisons.refine(filename, source.tree, tree, mask)
+        mapping = self.mapping_filter(filename, source, tree, edits)
+        if mapping is not None:
+            mask &= mapping
         return mask | protected
 
     def numbers(self, mask):

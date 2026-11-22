@@ -7,7 +7,12 @@ import itertools
 import json
 import operator
 
-ORDERING = {ast.Lt: operator.lt, ast.LtE: operator.le, ast.Gt: operator.gt, ast.GtE: operator.ge}
+ORDERING = {
+    ast.Lt: operator.lt,
+    ast.LtE: operator.le,
+    ast.Gt: operator.gt,
+    ast.GtE: operator.ge,
+}
 EQUALITY = (ast.Eq, ast.NotEq)
 IDENTITY = (ast.Is, ast.IsNot)
 UNKNOWN = ("?",)
@@ -113,7 +118,9 @@ class Comparisons:
     def __init__(self, path, names, all_mask):
         data = json.loads(path.read_bytes())
         if data["tests"] != names:
-            raise ValueError("operand index and coverage index use different test populations")
+            raise ValueError(
+                "operand index and coverage index use different test populations"
+            )
         self.atoms = [freeze(value) for value in data["atoms"]]
         self.masks = [int(bits, 16) & all_mask for bits in data["masks"]]
         self.sites = data["sites"]
@@ -125,6 +132,16 @@ class Comparisons:
         self.complete = all_mask & ~sum(
             1 << i for i, name in enumerate(names) if name in incomplete
         )
+
+    def lookup_users(self, filename, line, column, keys, hits):
+        observed = affected = 0
+        for atom, mask in self.sites.get(f"{filename}:{line}:{column}:0", ()):
+            group = self.masks[mask]
+            value = self.atoms[atom]
+            observed |= group
+            if value[0] != "str" or value[1] in keys:
+                affected |= group
+        return hits & ~(self.complete & observed & ~affected)
 
     def has_sites(self, filename, change):
         lines = self.site_lines.get(filename, ())
@@ -153,11 +170,15 @@ class Comparisons:
             return mask
         old, new = pair
         left = self.variants(filename, old, 0, old.left, new.left, mask)
-        right = self.variants(filename, old, 1, old.comparators[0], new.comparators[0], mask)
+        right = self.variants(
+            filename, old, 1, old.comparators[0], new.comparators[0], mask
+        )
         if not left or not right or len(left) * len(right) > 4096:
             return mask
         observed = unsafe = 0
-        for (a, next_a, group_a), (b, next_b, group_b) in itertools.product(left, right):
+        for (a, next_a, group_a), (b, next_b, group_b) in itertools.product(
+            left, right
+        ):
             group = group_a & group_b
             if not group:
                 continue

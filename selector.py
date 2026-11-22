@@ -5,6 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import time
+
+from replay import refine
 from pathlib import Path
 
 from impact import Impact
@@ -46,7 +49,9 @@ def fit_output(entries, limit=2_000_000):
     size = sum(len(row) + 1 for row in rows)  # json.dumps defaults to ASCII
     if size > limit:
         for i in sorted(range(len(rows)), key=lambda j: len(rows[j]), reverse=True):
-            empty = json.dumps({"commit": entries[i][0], "workers": []}, separators=(",", ":"))
+            empty = json.dumps(
+                {"commit": entries[i][0], "workers": []}, separators=(",", ":")
+            )
             size -= len(rows[i]) - len(empty)
             rows[i] = empty
             if size <= limit:
@@ -58,6 +63,8 @@ def run(data_dir, index_path, source_root):
     tests = json.loads((data_dir / "tests.json").read_bytes())["tests"]
     durations = {t["number"]: math.floor(t["seconds"] * 1000 + 0.5) for t in tests}
     impact = Impact(index_path, source_root.resolve(), tests)
+    catalogue = {t["number"]: t for t in tests}
+    deadline = time.monotonic() + 18
     schedules = {}
     entries = []
     for patch in sorted((data_dir / "commits").glob("*.patch")):
@@ -66,11 +73,28 @@ def run(data_dir, index_path, source_root):
             mask = 0
             for change in changes:
                 mask |= impact.select_file(change)
-        except (UnsupportedPatch, OSError, UnicodeError, SyntaxError, ValueError, RecursionError):
+        except (
+            UnsupportedPatch,
+            OSError,
+            UnicodeError,
+            SyntaxError,
+            ValueError,
+            RecursionError,
+        ):
             mask = impact.all
+            changes = []
         if mask not in schedules:
             schedules[mask] = schedule(impact.numbers(mask), durations)
-        entries.append((patch.stem, schedules[mask]))
+        workers = schedules[mask]
+        if len(changes) == 1 and workers:
+            selected = {n for group in workers for n in group}
+            kept = (
+                refine(changes[0], impact, catalogue, selected, deadline)
+                | impact.always
+            )
+            if kept != selected:
+                workers = schedule(kept, durations)
+        entries.append((patch.stem, workers))
     for row in fit_output(entries):
         print(row)
 
